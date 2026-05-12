@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# dic — 命令列字典查詢工具（bash 版）
+# 用法：
+#   dic 香蕉           兩本字典都查
+#   dic -r 香蕉        只查重編修訂本
+#   dic -c 香蕉        只查簡編本
+#   dic -a 香蕉        顯示所有匹配（包含部分匹配）
+#   dic -l 香蕉        只列出匹配的字詞名清單
+#   dic --no-color 香蕉   不染色
+#   dic -h             顯示說明
+
+set -u
+
+# ========================================
+# 設定區：改成你的 CSV 檔案完整路徑
+DICT_NAME_1="重編修訂本"
+DICT_PATH_1="$HOME/.local/share/dic/dict_revised.csv"
+DICT_NAME_2="簡編本"
+DICT_PATH_2="$HOME/.local/share/dic/dict_concise.csv"
+# ========================================
+
+PROG_NAME="dic"
+
+show_help() {
+    cat <<'EOF'
+dic — 命令列字典查詢工具
+用法：
+  dic 香蕉           兩本字典都查
+  dic -r 香蕉        只查重編修訂本
+  dic -c 香蕉        只查簡編本
+  dic -a 香蕉        顯示所有匹配（包含部分匹配）
+  dic -l 香蕉        只列出匹配的字詞名清單
+  dic --no-color 香蕉   不染色
+  dic -h             顯示說明
+EOF
+}
+
+# --- 顏色設定 ---
+COLOR_ENABLED=1
+
+setup_color() {
+    local force_off="$1"
+    if [[ "$force_off" == "1" ]] || [[ ! -t 1 ]]; then
+        COLOR_ENABLED=0
+    fi
+}
+
+c_wrap() {
+    # $1 = 顏色 code, $2 = 文字
+    if [[ "$COLOR_ENABLED" == "0" ]]; then
+        printf '%s' "$2"
+    else
+        printf '\033[%sm%s\033[0m' "$1" "$2"
+    fi
+}
+
+c_bold()   { c_wrap "1"     "$1"; }
+c_dim()    { c_wrap "2"     "$1"; }
+c_title()  { c_wrap "1;36"  "$1"; }   # 粗體青色
+c_zhuyin() { c_wrap "33"    "$1"; }   # 黃色
+c_book()   { c_wrap "1;35"  "$1"; }   # 粗體紫色（字典名）
+c_hint()   { c_wrap "2;37"  "$1"; }   # 淡灰色提示
+# 詞性 [名][動] 等，要在釋義裡 inline 染色，由 awk 處理
+
+# --- CSV 解析 ---
+# 完整處理 RFC 4180 風格 CSV：
+#   - 雙引號內可以有逗號、換行
+#   - 連續兩個雙引號 "" 代表一個字面雙引號
+# 輸出格式：每筆紀錄一行，欄位之間用 \x1f (US, unit separator) 分隔，
+# 欄位內的換行保留為字面 \n（兩個字元），方便後面再還原。
+#
+# 第一行（header）也會被輸出，呼叫端負責跳過。
+
+parse_csv() {
+    # $1 = 檔案路徑
+    awk -v FS="" '
+    BEGIN {
+        in_quote = 0
+        field = ""
+        nfields = 0
+        # 用陣列存當前 record 的所有欄位
+        delete fields
+    }
+    {
+        # awk 一行一行讀進來；如果上一行還在引號裡，就把換行補回去
+        if (in_quote) {
+            field = field "\\n"   # 字面 \n 兩字元，避免破壞分隔
+        }
+        line = $0
+        n = length(line)
+        for (i = 1; i <= n; i++) {
+            ch = substr(line, i, 1)
+            if (in_quote) {
+                if (ch == "\"") {
+                    # 看下一個字元，判斷是 escaped quote 還是收尾
+                    next_ch = (i < n) ? substr(line, i+1, 1) : ""
+                    if (next_ch == "\"") {
+                        field = field "\""
+                        i++
+                    } else {
+                        in_quote = 0
+                    }
+                } else {
+                    field = field ch
+                }
+            } else {
+                if (ch == "\"") {
+                    in_quote = 1
+                } else if (ch == ",") {
+                    fields[nfields++] = field
+                    field = ""
+                } else {
+                    field = field ch
+                }
+            }
+        }
+        # 行尾：如果不在引號內，代表一筆 record 結束
+        if (!in_quote) {
+            fields[nfields++] = field
+            # 印出這筆 record，欄位用 \x1f 分隔
+            out = ""
+            for (k = 0; k < nfields; k++) {
+                if (k > 0) out = out "\x1f"
+                out = out fields[k]
+            }
+            print out
+            # 重置
+            field = ""
+            nfields = 0
+            delete fields
+        }
+    }
+    ' "$1"
+}
+
+# 找出 header 中「字詞名」「注音一式」「釋義」的欄位編號
+# 輸出三個數字，用空格分隔
+find_columns() {
+    local file="$1"
+    parse_csv "$file" | head -n 1 | awk -F$'\x1f' '
+    {
+        idx_name = -1; idx_zhuyin = -1; idx_def = -1
+        for (i = 1; i <= NF; i++) {
+            if ($i == "字詞名")    idx_name   = i
+            if ($i == "注音一式")  idx_zhuyin = i
+            if ($i == "釋義")      idx_def    = i
+        }
+        printf "%d %d %d\n", idx_name, idx_zhuyin, idx_def
+    }
+    '
+}
+
+# 載入字典並依條件篩選
+# $1 = 檔案路徑
+# $2 = query
+# $3 = mode: "exact" 或 "all"
+# 輸出每筆結果：name \x1f zhuyin \x1f definition（其中 definition 內的換行還是字面 \n）
+search_dict() {
+    local file="$1"
+    local query="$2"
+    local mode="$3"
+
+    if [[ ! -f "$file" ]]; then
+        # 警告寫到 stderr
+        if [[ "$COLOR_ENABLED" == "1" ]]; then
+            printf '\033[2m警告：\033[0m找不到字典檔 %s\n' "$file" >&2
+        else
+            printf '警告：找不到字典檔 %s\n' "$file" >&2
+        fi
+        return
+    fi
+
+    local cols
+    cols=$(find_columns "$file")
+    local idx_name idx_zhuyin idx_def
+    read -r idx_name idx_zhuyin idx_def <<< "$cols"
+
+    if [[ "$idx_name" == "-1" ]]; then
+        return
+    fi
+
+    parse_csv "$file" | awk -F$'\x1f' \
+        -v idx_name="$idx_name" \
+        -v idx_zhuyin="$idx_zhuyin" \
+        -v idx_def="$idx_def" \
+        -v query="$query" \
+        -v mode="$mode" '
+    NR == 1 { next }   # 跳過 header
+    {
+        name = $idx_name
+        if (name == "") next
+
+        if (mode == "exact") {
+            if (name != query) next
+            sort_key = "0\t0\t" length(name) "\t" name
+        } else {
+            if (index(name, query) == 0) next
+            exact  = (name == query) ? 0 : 1
+            starts = (index(name, query) == 1) ? 0 : 1
+            sort_key = exact "\t" starts "\t" length(name) "\t" name
+        }
+
+        zhuyin = (idx_zhuyin > 0) ? $idx_zhuyin : ""
+        def    = (idx_def    > 0) ? $idx_def    : ""
+
+        # 用 sort_key 開頭，方便外面用 sort 排，後面再砍掉
+        # 欄位：sort_key \x1f name \x1f zhuyin \x1f definition
+        printf "%s\x1f%s\x1f%s\x1f%s\n", sort_key, name, zhuyin, def
+    }
+    ' | LC_ALL=C sort -t $'\x1f' -k1,1 | awk -F$'\x1f' '
+    {
+        # 砍掉第一欄 sort_key
+        out = ""
+        for (i = 2; i <= NF; i++) {
+            if (i > 2) out = out "\x1f"
+            out = out $i
+        }
+        print out
+    }
+    '
+}
+
+# 算字典裡「包含 query 但不完全相符」的筆數
+count_partial() {
+    local file="$1"
+    local query="$2"
+
+    if [[ ! -f "$file" ]]; then
+        echo 0
+        return
+    fi
+
+    local cols
+    cols=$(find_columns "$file")
+    local idx_name _z _d
+    read -r idx_name _z _d <<< "$cols"
+
+    if [[ "$idx_name" == "-1" ]]; then
+        echo 0
+        return
+    fi
+
+    parse_csv "$file" | awk -F$'\x1f' \
+        -v idx_name="$idx_name" \
+        -v query="$query" '
+    NR == 1 { next }
+    {
+        name = $idx_name
+        if (name == "") next
+        if (index(name, query) > 0 && name != query) c++
+    }
+    END { print c+0 }
+    '
+}
+
+# 把釋義裡的 [名][動][形] 之類染色
+# 從 stdin 讀，印到 stdout
+colorize_definition() {
+    if [[ "$COLOR_ENABLED" == "0" ]]; then
+        cat
+        return
+    fi
+    # 詞性標記：[ 後面 1~4 個非 []\n 字元，接 ]
+    # 用 sed 的 ERE
+    sed -E $'s/(\\[[^][\\n]{1,4}\\])/\033[1;32m\\1\033[0m/g'
+}
+
+# 印一筆字典資料
+# $1 = book_name
+# $2 = name
+# $3 = zhuyin
+# $4 = definition（其中換行為字面 \n 兩字元）
+print_entry() {
+    local book="$1"
+    local name="$2"
+    local zhuyin="$3"
+    local def="$4"
+
+    printf '  %s\n' "$(c_book "▎$book")"
+    printf '  %s  %s\n' "$(c_title "$name")" "$(c_zhuyin "$zhuyin")"
+
+    if [[ -n "$def" ]]; then
+        # 把字面 \n 還原成真的換行，每行縮排 4 格，然後染色詞性標記
+        # 並且把行尾的空白砍掉（對應 Python 的 .rstrip()）
+        printf '%s' "$def" \
+            | awk 'BEGIN{RS="\\\\n"} { sub(/[ \t\r]+$/, ""); print }' \
+            | sed -E '$ { /^$/d; }' \
+            | colorize_definition \
+            | sed 's/^/    /'
+    fi
+    printf '\n'
+}
+
+# --- 主程式 ---
+
+# 解析參數
+QUERY=""
+OPT_REVISED=0
+OPT_CONCISED=0
+OPT_ALL=0
+OPT_LIST=0
+OPT_NO_COLOR=0
+OPT_HELP=0
+
+# 自己處理參數（不用 getopt，因為要支援 --long 且不想引外部依賴）
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            OPT_HELP=1; shift ;;
+        -r|--revised)
+            OPT_REVISED=1; shift ;;
+        -c|--concised)
+            OPT_CONCISED=1; shift ;;
+        -a|--all)
+            OPT_ALL=1; shift ;;
+        -l|--list)
+            OPT_LIST=1; shift ;;
+        --no-color)
+            OPT_NO_COLOR=1; shift ;;
+        --)
+            shift
+            if [[ $# -gt 0 ]]; then QUERY="$1"; shift; fi
+            ;;
+        -*)
+            # 支援 -rc 這種合併短參數
+            arg="${1#-}"
+            if [[ "$arg" =~ ^[rcalh]+$ ]]; then
+                for (( i=0; i<${#arg}; i++ )); do
+                    ch="${arg:$i:1}"
+                    case "$ch" in
+                        r) OPT_REVISED=1 ;;
+                        c) OPT_CONCISED=1 ;;
+                        a) OPT_ALL=1 ;;
+                        l) OPT_LIST=1 ;;
+                        h) OPT_HELP=1 ;;
+                    esac
+                done
+                shift
+            else
+                printf 'dic: 未知選項 %s\n' "$1" >&2
+                exit 2
+            fi
+            ;;
+        *)
+            if [[ -z "$QUERY" ]]; then
+                QUERY="$1"
+            fi
+            shift ;;
+    esac
+done
+
+if [[ "$OPT_HELP" == "1" ]] || [[ -z "$QUERY" ]]; then
+    show_help
+    exit 0
+fi
+
+setup_color "$OPT_NO_COLOR"
+
+# 決定要查哪幾本
+declare -a CHOSEN_NAMES CHOSEN_PATHS
+if [[ "$OPT_REVISED" == "1" && "$OPT_CONCISED" == "1" ]]; then
+    CHOSEN_NAMES=("$DICT_NAME_1" "$DICT_NAME_2")
+    CHOSEN_PATHS=("$DICT_PATH_1" "$DICT_PATH_2")
+elif [[ "$OPT_REVISED" == "1" ]]; then
+    CHOSEN_NAMES=("$DICT_NAME_1")
+    CHOSEN_PATHS=("$DICT_PATH_1")
+elif [[ "$OPT_CONCISED" == "1" ]]; then
+    CHOSEN_NAMES=("$DICT_NAME_2")
+    CHOSEN_PATHS=("$DICT_PATH_2")
+else
+    CHOSEN_NAMES=("$DICT_NAME_1" "$DICT_NAME_2")
+    CHOSEN_PATHS=("$DICT_PATH_1" "$DICT_PATH_2")
+fi
+
+# -l 列表模式 → 自動切到 all
+if [[ "$OPT_ALL" == "1" || "$OPT_LIST" == "1" ]]; then
+    MODE="all"
+else
+    MODE="exact"
+fi
+
+# 收集每本字典的結果。
+# 因為 bash 沒有結構化資料，把每本字典的結果暫存到一個 tmp 檔。
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+TOTAL_RESULTS=0
+TOTAL_PARTIAL=0
+NUM_BOOKS=${#CHOSEN_NAMES[@]}
+
+# partial counts per book（給 exact 模式用，提示「另有 N 筆包含」）
+declare -a BOOK_RESULT_COUNTS BOOK_PARTIAL_COUNTS BOOK_RESULT_FILES
+
+for (( bi=0; bi<NUM_BOOKS; bi++ )); do
+    name="${CHOSEN_NAMES[$bi]}"
+    path="${CHOSEN_PATHS[$bi]}"
+    out_file="$TMP_DIR/book_$bi"
+
+    search_dict "$path" "$QUERY" "$MODE" > "$out_file"
+    count=$(wc -l < "$out_file" | tr -d ' ')
+    BOOK_RESULT_COUNTS[$bi]="$count"
+    BOOK_RESULT_FILES[$bi]="$out_file"
+    TOTAL_RESULTS=$(( TOTAL_RESULTS + count ))
+
+    if [[ "$MODE" == "exact" ]]; then
+        partial=$(count_partial "$path" "$QUERY")
+    else
+        partial=0
+    fi
+    BOOK_PARTIAL_COUNTS[$bi]="$partial"
+    TOTAL_PARTIAL=$(( TOTAL_PARTIAL + partial ))
+done
+
+# --- 列表模式：只印字詞名 ---
+if [[ "$OPT_LIST" == "1" ]]; then
+    for (( bi=0; bi<NUM_BOOKS; bi++ )); do
+        count="${BOOK_RESULT_COUNTS[$bi]}"
+        [[ "$count" == "0" ]] && continue
+        name="${CHOSEN_NAMES[$bi]}"
+        file="${BOOK_RESULT_FILES[$bi]}"
+        printf '%s（%d 筆）\n' "$(c_book "$name")" "$count"
+        while IFS=$'\x1f' read -r n zh _; do
+            printf '  %s  %s\n' "$(c_title "$n")" "$(c_dim "$zh")"
+        done < "$file"
+        printf '\n'
+    done
+    if [[ "$TOTAL_RESULTS" == "0" ]]; then
+        printf '找不到「%s」\n' "$QUERY"
+        exit 1
+    fi
+    exit 0
+fi
+
+# --- 一般輸出 ---
+if [[ "$TOTAL_RESULTS" == "0" ]]; then
+    printf '找不到「%s」\n' "$(c_bold "$QUERY")"
+    if [[ "$TOTAL_PARTIAL" -gt 0 && "$MODE" == "exact" ]]; then
+        printf '%s\n' "$(c_hint "但有 $TOTAL_PARTIAL 筆字詞包含「$QUERY」，加 -a 查看全部")"
+    fi
+    exit 1
+fi
+
+# 標題
+if [[ "$MODE" == "all" ]]; then
+    printf '%s%s %s\n\n' \
+        "$(c_dim "查詢：")" \
+        "$(c_bold "$QUERY")" \
+        "$(c_dim "（共 $TOTAL_RESULTS 筆匹配）")"
+else
+    printf '%s%s\n\n' "$(c_dim "查詢：")" "$(c_bold "$QUERY")"
+fi
+
+# 各本字典的結果
+for (( bi=0; bi<NUM_BOOKS; bi++ )); do
+    name="${CHOSEN_NAMES[$bi]}"
+    count="${BOOK_RESULT_COUNTS[$bi]}"
+    partial="${BOOK_PARTIAL_COUNTS[$bi]}"
+    file="${BOOK_RESULT_FILES[$bi]}"
+
+    if [[ "$count" == "0" ]]; then
+        if [[ "$MODE" == "exact" && "$partial" -gt 0 ]]; then
+            printf '  %s\n' "$(c_book "▎$name")"
+            printf '    %s\n\n' "$(c_hint "沒有完全相符，但有 $partial 筆包含此字")"
+        fi
+        continue
+    fi
+    while IFS=$'\x1f' read -r n zh def; do
+        print_entry "$name" "$n" "$zh" "$def"
+    done < "$file"
+done
+
+# 結尾提示
+if [[ "$MODE" == "exact" && "$TOTAL_PARTIAL" -gt 0 ]]; then
+    printf '%s\n' "$(c_hint "另有 $TOTAL_PARTIAL 筆字詞包含「$QUERY」，加 -a 查看全部，或 -l 只看清單")"
+fi
+
+exit 0
