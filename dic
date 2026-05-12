@@ -442,12 +442,12 @@ fi
 
 # 標題
 if [[ "$MODE" == "all" ]]; then
-    printf '%s%s %s\n\n' \
+    printf '\n%s%s %s\n\n' \
         "$(c_dim "查詢：")" \
         "$(c_bold "$QUERY")" \
         "$(c_dim "（共 $TOTAL_RESULTS 筆匹配）")"
 else
-    printf '%s%s\n\n' "$(c_dim "查詢：")" "$(c_bold "$QUERY")"
+    printf '\n%s%s\n\n' "$(c_dim "查詢：")" "$(c_bold "$QUERY")"
 fi
 
 # 各本字典的結果
