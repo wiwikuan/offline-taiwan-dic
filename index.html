@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>超級快速的離線國語辭典！</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", "Microsoft JhengHei", sans-serif;
+    background: #fafaf7;
+    color: #222;
+    line-height: 1.6;
+  }
+  header {
+    padding: 16px 24px;
+    background: #fff;
+    border-bottom: 1px solid #e5e5e0;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .top-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  .dict-switch {
+    display: flex;
+    border: 1px solid #d0d0c8;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .dict-btn {
+    padding: 9px 14px;
+    font-size: 14px;
+    background: #fff;
+    border: none;
+    cursor: pointer;
+    color: #555;
+    transition: background 0.1s;
+    font-family: inherit;
+  }
+  .dict-btn + .dict-btn {
+    border-left: 1px solid #e5e5e0;
+  }
+  .dict-btn:hover { background: #f5f5f0; }
+  .dict-btn.active {
+    background: #333;
+    color: #fff;
+  }
+  .dict-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+  }
+  #search {
+    flex: 1;
+    padding: 10px 14px;
+    font-size: 16px;
+    border: 1px solid #d0d0c8;
+    border-radius: 6px;
+    background: #fff;
+  }
+  #search:focus {
+    outline: none;
+    border-color: #888;
+  }
+  #status {
+    font-size: 13px;
+    color: #777;
+    white-space: nowrap;
+  }
+  main {
+    display: flex;
+    max-width: 1400px;
+    margin: 0 auto;
+    height: calc(100vh - 73px);
+  }
+  #list {
+    width: 240px;
+    border-right: 1px solid #e5e5e0;
+    overflow-y: auto;
+    background: #fff;
+  }
+  .item {
+    padding: 10px 16px;
+    border-bottom: 1px solid #f0f0ec;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .item:hover { background: #f5f5f0; }
+  .item.active { background: #e8e8df; }
+  .item-name {
+    font-size: 18px;
+    font-weight: 600;
+    margin-right: 8px;
+  }
+  .item-zhuyin {
+    font-size: 12px;
+    color: #888;
+  }
+  #detail {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 36px;
+  }
+  .empty {
+    color: #999;
+    text-align: center;
+    margin-top: 40px;
+    font-size: 14px;
+  }
+  .detail-name {
+    font-size: 48px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    line-height: 1.2;
+  }
+  .detail-zhuyin {
+    font-size: 20px;
+    color: #555;
+    margin-bottom: 24px;
+  }
+  .detail-content {
+    font-size: 16px;
+    white-space: pre-wrap;
+    line-height: 1.9;
+  }
+  .more-hint {
+    padding: 12px 16px;
+    color: #999;
+    font-size: 12px;
+    text-align: center;
+  }
+  @media (max-width: 700px) {
+    main { flex-direction: column; height: auto; }
+    #list { width: 100%; max-height: 40vh; }
+    #detail { padding: 20px; }
+    .detail-name { font-size: 36px; }
+    .top-row { flex-wrap: wrap; }
+    #search { order: 3; width: 100%; flex: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="top-row">
+    <div class="dict-switch">
+      <button class="dict-btn active" data-dict="0">重編修訂本</button>
+      <button class="dict-btn" data-dict="1">簡編本</button>
+    </div>
+    <input id="search" type="text" placeholder="載入中⋯⋯" disabled>
+    <div id="status">準備中</div>
+  </div>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="detail">
+    <div class="empty">在上方輸入想查的字詞</div>
+  </div>
+</main>
+
+<script>
+// ========================================
+// 設定區：改成你的 CSV 檔名
+const DICT_FILES = [
+  { name: '重編修訂本', file: 'dict_revised.csv' },
+  { name: '簡編本',     file: 'dict_concise.csv' },
+];
+// ========================================
+
+/**
+ * 自製 CSV parser
+ * 支援：欄位用雙引號包起來、雙引號內可有換行、""表示一個雙引號
+ * 不支援：複雜的引號跳脫（你的資料用不到）
+ *
+ * 規則（RFC 4180）：
+ *   - 一行一筆資料，欄位用逗號分隔
+ *   - 若欄位包含逗號、雙引號、或換行，整個欄位用 " 包起來
+ *   - 若被包起來的欄位內含 "，用兩個 "" 表示一個 "
+ *
+ * 用狀態機掃過去：兩個狀態 = 「在引號內」或「在引號外」
+ */
+function parseCSV(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  const len = text.length;
+
+  for (let i = 0; i < len; i++) {
+    const ch = text[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        // 看下一個字元
+        if (text[i + 1] === '"') {
+          // 兩個雙引號 = 一個雙引號
+          field += '"';
+          i++;
+        } else {
+          // 引號結束
+          inQuotes = false;
+        }
+      } else {
+        // 引號內的任何字元（包括換行、逗號）都是欄位內容
+        field += ch;
+      }
+    } else {
+      if (ch === '"') {
+        // 進入引號（通常出現在欄位開頭）
+        inQuotes = true;
+      } else if (ch === ',') {
+        // 欄位結束
+        row.push(field);
+        field = '';
+      } else if (ch === '\n') {
+        // 列結束
+        row.push(field);
+        rows.push(row);
+        row = [];
+        field = '';
+      } else if (ch === '\r') {
+        // 忽略 CR，等下個字元（通常會接 LF）
+      } else {
+        field += ch;
+      }
+    }
+  }
+
+  // 處理最後一個欄位/列（檔案結尾可能沒有換行）
+  if (field !== '' || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+/**
+ * 把第一列當 header，其餘轉成 [{欄位名: 值}, ...]
+ */
+function rowsToObjects(rows) {
+  if (rows.length === 0) return [];
+  const headers = rows[0];
+  const result = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.length === 1 && row[0] === '') continue; // 跳過空行
+    const obj = {};
+    for (let j = 0; j < headers.length; j++) {
+      obj[headers[j]] = row[j] || '';
+    }
+    result.push(obj);
+  }
+  return result;
+}
+
+const dicts = DICT_FILES.map(d => ({
+  ...d,
+  data: null,
+  loading: false,
+  loaded: false,
+  error: null,
+}));
+
+let currentDictIdx = 0;
+let filtered = [];
+let activeIndex = -1;
+let searchTimer = null;
+
+const $search = document.getElementById('search');
+const $status = document.getElementById('status');
+const $list = document.getElementById('list');
+const $detail = document.getElementById('detail');
+const $btns = document.querySelectorAll('.dict-btn');
+
+async function loadDict(idx) {
+  const dict = dicts[idx];
+  if (dict.loaded || dict.loading) return;
+  dict.loading = true;
+
+  try {
+    if (idx === currentDictIdx) {
+      $status.textContent = `下載 ${dict.name}⋯⋯`;
+    }
+
+    // 用 streaming fetch + 進度回報
+    const response = await fetch(dict.file);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const total = +response.headers.get('Content-Length') || 0;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let received = 0;
+    let text = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      text += decoder.decode(value, { stream: true });
+      if (idx === currentDictIdx && total) {
+        const pct = Math.round(received / total * 100);
+        $status.textContent = `下載 ${dict.name}：${pct}%`;
+      }
+    }
+    text += decoder.decode();
+
+    if (idx === currentDictIdx) {
+      $status.textContent = `解析 ${dict.name}⋯⋯`;
+    }
+
+    // 解析放到下一個 frame，避免卡 UI
+    await new Promise(r => setTimeout(r, 0));
+    const rows = parseCSV(text);
+    const objects = rowsToObjects(rows);
+
+    dict.data = objects.filter(o => o['字詞名']);
+    dict.loaded = true;
+    dict.loading = false;
+
+    if (idx === currentDictIdx) {
+      onDictReady();
+    }
+  } catch (err) {
+    dict.error = err.message;
+    dict.loading = false;
+    if (idx === currentDictIdx) {
+      $status.textContent = `載入失敗：${err.message}`;
+    }
+  }
+}
+
+function onDictReady() {
+  const dict = dicts[currentDictIdx];
+  $search.disabled = false;
+  $search.placeholder = `搜尋 ${dict.data.length.toLocaleString()} 筆字詞⋯⋯`;
+  $status.textContent = `${dict.name}：${dict.data.length.toLocaleString()} 筆`;
+  $btns.forEach((b, i) => {
+    b.disabled = false;
+    b.classList.toggle('active', i === currentDictIdx);
+  });
+
+  if ($search.value.trim()) {
+    doSearch($search.value);
+  } else {
+    $search.focus();
+  }
+}
+
+async function switchDict(idx) {
+  if (idx === currentDictIdx) return;
+  currentDictIdx = idx;
+  $btns.forEach((b, i) => b.classList.toggle('active', i === idx));
+
+  const dict = dicts[idx];
+  if (dict.loaded) {
+    onDictReady();
+  } else if (dict.error) {
+    $status.textContent = `載入失敗：${dict.error}`;
+    $btns.forEach(b => b.disabled = false);
+  } else {
+    $search.disabled = true;
+    $status.textContent = `載入 ${dict.name}⋯⋯`;
+    await loadDict(idx);
+  }
+}
+
+function render() {
+  if (filtered.length === 0) {
+    $list.innerHTML = '<div class="empty" style="padding:20px;">沒有匹配的字詞</div>';
+    $detail.innerHTML = '<div class="empty">沒有匹配的字詞</div>';
+    activeIndex = -1;
+    return;
+  }
+
+  const MAX = 500;
+  const slice = filtered.slice(0, MAX);
+  const moreHint = filtered.length > MAX
+    ? `<div class="more-hint">⋯⋯還有 ${filtered.length - MAX} 筆未顯示，請縮小搜尋範圍</div>`
+    : '';
+
+  $list.innerHTML = slice.map((item, i) => `
+    <div class="item ${i === activeIndex ? 'active' : ''}" data-i="${i}">
+      <span class="item-name">${escapeHtml(item['字詞名'] || '')}</span>
+      <span class="item-zhuyin">${escapeHtml(item['注音一式'] || '')}</span>
+    </div>
+  `).join('') + moreHint;
+
+  if (activeIndex < 0 || activeIndex >= filtered.length) {
+    activeIndex = 0;
+  }
+  renderDetail();
+}
+
+function renderDetail() {
+  const item = filtered[activeIndex];
+  if (!item) {
+    $detail.innerHTML = '<div class="empty">沒有匹配的字詞</div>';
+    return;
+  }
+
+  $detail.innerHTML = `
+    <h1 class="detail-name">${escapeHtml(item['字詞名'] || '')}</h1>
+    <div class="detail-zhuyin">${escapeHtml(item['注音一式'] || '')}</div>
+    <div class="detail-content">${escapeHtml(item['釋義'] || '')}</div>
+  `;
+
+  $list.querySelectorAll('.item').forEach((el, i) => {
+    el.classList.toggle('active', i === activeIndex);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function doSearch(q) {
+  q = q.trim();
+  const dict = dicts[currentDictIdx];
+  if (!dict.loaded) return;
+
+  if (!q) {
+    filtered = [];
+    $list.innerHTML = '<div class="empty" style="padding:20px;">在上方輸入想查的字詞</div>';
+    $detail.innerHTML = '<div class="empty">在上方輸入想查的字詞</div>';
+    $status.textContent = `${dict.name}：${dict.data.length.toLocaleString()} 筆`;
+    return;
+  }
+
+  filtered = dict.data.filter(item => (item['字詞名'] || '').includes(q));
+
+  filtered.sort((a, b) => {
+    const an = a['字詞名'] || '';
+    const bn = b['字詞名'] || '';
+    const aExact = an === q ? 0 : 1;
+    const bExact = bn === q ? 0 : 1;
+    if (aExact !== bExact) return aExact - bExact;
+    const aStart = an.startsWith(q) ? 0 : 1;
+    const bStart = bn.startsWith(q) ? 0 : 1;
+    if (aStart !== bStart) return aStart - bStart;
+    return an.length - bn.length;
+  });
+
+  activeIndex = 0;
+  render();
+  $status.textContent = `${dict.name}｜匹配 ${filtered.length.toLocaleString()} 筆`;
+}
+
+$search.addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => doSearch(e.target.value), 100);
+});
+
+$list.addEventListener('click', e => {
+  const item = e.target.closest('.item');
+  if (!item) return;
+  activeIndex = +item.dataset.i;
+  renderDetail();
+});
+
+$search.addEventListener('keydown', e => {
+  if (filtered.length === 0) return;
+  const maxIdx = Math.min(filtered.length, 500) - 1;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    activeIndex = Math.min(activeIndex + 1, maxIdx);
+    renderDetail();
+    scrollActiveIntoView();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    activeIndex = Math.max(activeIndex - 1, 0);
+    renderDetail();
+    scrollActiveIntoView();
+  }
+});
+
+function scrollActiveIntoView() {
+  const el = $list.querySelector('.item.active');
+  if (el) el.scrollIntoView({ block: 'nearest' });
+}
+
+$btns.forEach((btn, i) => {
+  btn.addEventListener('click', () => switchDict(i));
+});
+
+// 先載第一本，第二本背景延遲載
+loadDict(0).then(() => {
+  setTimeout(() => loadDict(1), 500);
+});
+</script>
+</body>
+</html>
