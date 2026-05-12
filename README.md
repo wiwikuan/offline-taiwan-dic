@@ -9,7 +9,7 @@
 ```
 .
 ├── index.html
-├── dict_revised.csv     # 重編國語辭典修訂本
+├── dict_revised.csv    # 重編國語辭典修訂本
 └── dict_concise.csv    # 國語辭典簡編本
 ```
 
