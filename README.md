@@ -10,7 +10,7 @@
 .
 ├── index.html
 ├── dict_revised.csv     # 重編國語辭典修訂本
-└── dict_concised.csv    # 國語辭典簡編本
+└── dict_concise.csv    # 國語辭典簡編本
 ```
 
 CSV 檔名可以在 `index.html` 的 `DICT_FILES` 設定區改。
